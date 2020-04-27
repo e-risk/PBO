@@ -5,18 +5,17 @@ from os import path
 import copy
 import sys
 
-import matplotlib.pyplot as plt
+from Hazards import Stationary
 
 class Stochastic:
 
-    def __init__(self, power_spectrum_object=None, power_spectrum_script=None, model=None, ndof=None, freq=None):
+    def __init__(self, power_spectrum=None, model=None, ndof=None, freq=None):
 
         # todo: implement the case of full matrix power spectrum
-        self.power_spectrum_object = power_spectrum_object
-        self.power_spectrum_script = power_spectrum_script
         self.model = model
         self.ndof = ndof
         self.freq = freq
+        self.power_spectrum = power_spectrum
 
         # Initial guess of the iterative process in the statistical linearization
         if ndof >= 1:
@@ -26,31 +25,10 @@ class Stochastic:
         else:
             raise ValueError('ndof MUST be larger than or equal to 1.')
 
-        if power_spectrum_script is not None:
-            self.user_ps_check = path.exists(power_spectrum_script)
-        else:
-            self.user_ps_check = False
-
-        if self.user_ps_check:
-            try:
-                self.module_dist = __import__(self.power_spectrum_script[:-3])
-            except ImportError:
-                raise ImportError('There is no module implementing a power spectru,.')
-
         if self.model is 'bouc_wen':
             self.create_matrices = 'create_matrix_bw'
             self.equivalent_elements = 'equivalent_elements_bw'
-
-    def white_noise(self, kwargs):
-
-        if 'S0' in kwargs.keys():
-            S0 = kwargs['S0']
-        else:
-            raise ValueError('S0 cannot be None.')
-
-        power_spectrum = S0
-
-        return np.array(power_spectrum)
+            self.mck_matrices = 'mck_matrices_bw'
 
     def statistical_linearization(self, M=None, C=None, K=None, tol=1e-3, maxiter=1000, **kwargs):
 
@@ -63,20 +41,8 @@ class Stochastic:
         if maxiter<1:
             raise ValueError('maxiter cannot be lower than 1')
 
-        if self.user_ps_check:
-            if self.power_spectrum_script is None:
-                raise TypeError('power_spectrum_script cannot be None')
-
-            exec('from ' + self.power_spectrum_script[:-3] + ' import ' + self.power_spectrum_object)
-            power_spectrum_fun = eval(self.power_spectrum_object)
-        else:
-            if self.power_spectrum_object is None:
-                raise TypeError('power_spectrum_object cannot be None')
-
-            power_spectrum_fun = eval("Stochastic." + self.power_spectrum_object)
-
         freq = self.freq
-        power_spectrum = power_spectrum_fun(self, kwargs)
+        power_spectrum = self.power_spectrum
 
         Mt = np.zeros(np.shape(M))
         Ct = np.zeros(np.shape(C))
@@ -197,3 +163,117 @@ class Stochastic:
 
         return ceq, keq, Var, Vard
 
+    def create_mck(self, m=None, c=None, k=None, **kwargs):
+
+        mck_matrices_fun = eval("Stochastic." + self.mck_matrices)
+        M, C, K = mck_matrices_fun(self, m=m, c=c, k=k, kwargs=kwargs)
+
+        return M, C, K
+
+    def mck_matrices_bw(self, m=None, c=None, k=None, kwargs=None):
+
+        ndof = self.ndof
+
+        if 'gamma' in kwargs.keys():
+            gamma = kwargs['gamma']
+        else:
+            raise ValueError('gamma cannot be None.')
+
+        if 'nu' in kwargs.keys():
+            nu = kwargs['nu']
+        else:
+            raise ValueError('nu cannot be None.')
+
+        if 'alpha' in kwargs.keys():
+            alpha = kwargs['alpha']
+        else:
+            raise ValueError('alpha cannot be None.')
+
+        if 'a' in kwargs.keys():
+            a = kwargs['a']
+            for i in range(ndof):
+                if a[i] < 0:
+                    raise ValueError('a cannot be less than 0.')
+        else:
+            raise ValueError('a cannot be None.')
+
+        M = np.zeros((2 * ndof, 2 * ndof))
+        C = np.eye(2 * ndof)
+        K = np.zeros((2 * ndof, 2 * ndof))
+        # Mass matrix
+
+        for i in range(ndof):
+            C[i,i] = c[i]
+            K[i,i] = a[i]*k[i]
+            K[i, i+ndof] = (1-a[i]) * k[i]
+
+            if i < ndof-1:
+                C[i,i+1] = -c[i]
+                K[i, i + 1] = -a[i]*k[i]
+                K[i, i + ndof + 1] = -(1 - a[i]) * k[i]
+
+            for j in range(i+1):
+                M[i,j] = m[i]
+
+        return M, C, K
+
+    def linear_damping(self, m=None, k=None, ksi=None):
+
+        ndof = self.ndof
+
+        Minv = np.zeros((ndof, ndof))
+        M = np.zeros((ndof, ndof))
+        MK = np.zeros((ndof, ndof))
+        C = np.zeros((ndof, ndof))
+        K = np.zeros((ndof, ndof))
+        c = np.zeros((ndof))
+
+        for i in range(ndof):
+            if m[i] <= 0:
+                raise ValueError('Mass cannot be lower than or equal to zero!')
+            Minv[i,i] = 1/m[i]
+            M[i,i] = m[i]
+
+            if i < ndof-1:
+                K[i, i] = k[i] + k[i + 1]
+                K[i, i + 1] = -k[i + 1]
+                K[i + 1, i] = -k[i + 1]
+
+        K[-1,-1] = k[-1]
+        MK = Minv.dot(K)
+
+        wn = np.linalg.eigvals(MK)
+        wn = np.sqrt(wn)
+        # Damping proportional to mass and stiffness such that: [C] = b0 * [M] + b1 * [K]
+
+        b0 = ((2 * wn[1] * wn[0]) / (wn[0] ** 2 - wn[1] ** 2))*(wn[0] * ksi[1] - wn[1] * ksi[0])
+        b1 = (2 / (wn[0] ** 2 - wn[1] ** 2))*(wn[0] * ksi[0] - wn[1] * ksi[1])
+
+        # Damping proportional to stiffness
+        C = b1 * K
+
+        for i in range(ndof-1):
+            c[i+1] = -C[i,i+1]
+
+        c[0] = C[0,0]-c[1]
+        return c
+
+    @staticmethod
+    def linear_mean_response(k=None, F=None):
+
+        ndof = len(k)
+        KF = np.zeros((ndof, ndof))
+        K = np.zeros((ndof, ndof))
+        w = np.zeros((ndof))
+
+        for i in range(ndof):
+            K[i,i] = k[i]
+            w[i] = F[i]
+
+            if i < ndof-1:
+                K[i, i + 1] = -k[i]
+
+        KF = np.linalg.inv(K)
+        mean_response = KF.dot(F)
+
+        return mean_response
